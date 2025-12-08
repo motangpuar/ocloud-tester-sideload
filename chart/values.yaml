@@ -1,0 +1,20 @@
+# values.yaml
+nodeSelector:
+  kubernetes.io/hostname: joule
+
+image:
+  repository: bmw.ece.ntust.edu.tw/infidel/gnb-perf
+  tag: sideload
+  pullPolicy: Always
+
+service:
+  port: 8080
+  type: ClusterIP
+
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: 5g-radio
+    effect: NoSchedule
+
+podName: perf-audit-origin
