@@ -17,8 +17,6 @@ tolerations:
     value: 5g-radio
     effect: NoSchedule
 
-env:
-  - name: RAPP_URL
-    value: "http://REPLACE_ME"
+env: []
 
 podName: perf-audit-origin
