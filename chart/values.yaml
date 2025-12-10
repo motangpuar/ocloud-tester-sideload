@@ -17,4 +17,6 @@ tolerations:
     value: 5g-radio
     effect: NoSchedule
 
+env: []
+
 podName: perf-audit-origin

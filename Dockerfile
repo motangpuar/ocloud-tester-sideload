@@ -15,7 +15,9 @@ RUN apt-get update && \
     python3 \
     python3-pip \
     python3-flask \
+    python3-requests \
     tuned \
+    sysstat \
     && rm -rf /var/lib/apt/lists/*
 
 # Install FlameGraph

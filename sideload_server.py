@@ -8,6 +8,9 @@ import re
 import requests
 
 app = Flask(__name__)
+svc_port = os.getenv('SVC_PORT', '8080')
+rapp_url = os.getenv('RAPP_URL', 'http://rapp-service:5000')
+node_name = os.getenv('NODE_NAME', 'unknown')
 
 def run_cmd(cmd):
     try:
@@ -284,8 +287,6 @@ def get_rt_report():
 
 def register_with_rapp():
     """Register with rApp - only provide node identity"""
-    rapp_url = os.getenv('RAPP_URL', 'http://rapp-service:5000')
-    node_name = os.getenv('NODE_NAME', 'unknown')
 
     ip = get_node_ip()
     if not ip:
@@ -297,7 +298,7 @@ def register_with_rapp():
     payload = {
         'node_name': node_name,
         'ip_address': ip,
-        'port': 8080,
+        'port': svc_port,
         'rt_config': rt_report
     }
 
@@ -341,8 +342,363 @@ def report():
         'rt_config': rt_report
     })
 
+
+# SIDELOAD ACTIONS ----------------------------------
+@app.route('/perf/context_switches', methods=['POST'])
+def perf_context_switches():
+    """Measure context switches with filters"""
+    data = request.json or {}
+    duration = data.get('duration', 5)
+    pid = data.get('pid')
+    pgrep = data.get('pgrep')
+    cpu_range = data.get('cpu_range')  # e.g., "0-7"
+    cpu_list = data.get('cpu_list')    # e.g., [0, 2, 4]
+
+    # Build perf command
+    cmd_parts = ["nsenter -t 1 -m -u -n -i perf stat -e context-switches"]
+
+    # CPU filter
+    if cpu_range:
+        cmd_parts.append(f"-C {cpu_range}")
+    elif cpu_list:
+        cpu_str = ','.join(map(str, cpu_list))
+        cmd_parts.append(f"-C {cpu_str}")
+    else:
+        cmd_parts.append("-a")  # all CPUs
+
+    # Process filter
+    if pid:
+        cmd_parts.append(f"-p {pid}")
+    elif pgrep:
+        # Get PIDs matching pattern
+        pgrep_cmd = f"nsenter -t 1 -m -u -n -i pgrep {pgrep}"
+        pids = run_cmd(pgrep_cmd)
+        if pids:
+            pid_list = ','.join(pids.split('\n'))
+            cmd_parts.append(f"-p {pid_list}")
+        else:
+            return jsonify({'error': f'no process found for pattern: {pgrep}'}), 404
+
+    cmd_parts.append(f"sleep {duration} 2>&1")
+    cmd = ' '.join(cmd_parts)
+
+    result = run_cmd(cmd)
+
+    # Parse result
+    count = None
+    if result:
+        match = re.search(r'([\d,]+)\s+context-switches', result)
+        if match:
+            count = int(match.group(1).replace(',', ''))
+
+    return jsonify({
+        'duration': duration,
+        'context_switches': count,
+        'filter': {
+            'pid': pid,
+            'pgrep': pgrep,
+            'cpu_range': cpu_range,
+            'cpu_list': cpu_list
+        },
+        'raw': result
+    })
+
+@app.route('/perf/cpu_usage', methods=['POST'])
+def perf_cpu_usage():
+    """Measure CPU usage over time"""
+    data = request.json or {}
+    duration = data.get('duration', 10)
+    interval = data.get('interval', 1)  # sampling interval
+    pid = data.get('pid')
+    pgrep = data.get('pgrep')
+    per_cpu = data.get('per_cpu', False)  # report per-CPU breakdown
+
+    # Get PID if pgrep provided
+    target_pid = pid
+    if pgrep and not pid:
+        pgrep_cmd = f"nsenter -t 1 -m -u -n -i pgrep {pgrep}"
+        pids = run_cmd(pgrep_cmd)
+        if pids:
+            target_pid = pids.split('\n')[0]  # first match
+        else:
+            return jsonify({'error': f'no process found: {pgrep}'}), 404
+
+    # Build command
+    if per_cpu:
+        # mpstat for per-CPU breakdown
+        cmd = f"nsenter -t 1 -m -u -n -i mpstat -P ALL {interval} {duration // interval}"
+    elif target_pid:
+        # pidstat for specific process
+        cmd = f"nsenter -t 1 -m -u -n -i pidstat -p {target_pid} {interval} {duration // interval}"
+    else:
+        # mpstat for overall CPU
+        cmd = f"nsenter -t 1 -m -u -n -i mpstat {interval} {duration // interval}"
+
+    result = run_cmd(cmd)
+
+    # Parse result
+    cpu_usage = parse_cpu_output(result, per_cpu, target_pid)
+
+    return jsonify({
+        'duration': duration,
+        'interval': interval,
+        'cpu_usage': cpu_usage,
+        'filter': {
+            'pid': target_pid,
+            'pgrep': pgrep,
+            'per_cpu': per_cpu
+        },
+        'raw': result
+    })
+
+def parse_cpu_output(output, per_cpu, pid):
+    """Parse mpstat/pidstat output"""
+    if not output:
+        return None
+
+    lines = output.strip().split('\n')
+    samples = []
+
+    for line in lines:
+        # Skip headers
+        if 'CPU' in line or 'Linux' in line or 'Average' in line or not line.strip():
+            continue
+
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        try:
+            if per_cpu:
+                # mpstat -P ALL: timestamp CPU %usr %nice %sys %iowait %irq %soft %steal %guest %gnice %idle
+                cpu_id = parts[1]
+                idle = float(parts[-1])
+                usage = 100.0 - idle
+                samples.append({'cpu': cpu_id, 'usage_percent': round(usage, 2)})
+            elif pid:
+                # pidstat: TIME AM/PM UID PID %usr %system %guest %wait %CPU CPU Command
+                # parts[8] is %CPU
+                usage = float(parts[8])
+                samples.append({'usage_percent': round(usage, 2)})
+            else:
+                # mpstat: timestamp CPU %usr %nice %sys %iowait %irq %soft %steal %guest %gnice %idle
+                idle = float(parts[-1])
+                usage = 100.0 - idle
+                samples.append({'usage_percent': round(usage, 2)})
+        except:
+            continue
+
+    if not samples:
+        return None
+
+    # Calculate statistics
+    if per_cpu:
+        # Group by CPU
+        by_cpu = {}
+        for sample in samples:
+            cpu = sample['cpu']
+            if cpu not in by_cpu:
+                by_cpu[cpu] = []
+            by_cpu[cpu].append(sample['usage_percent'])
+
+        result = {}
+        for cpu, values in by_cpu.items():
+            result[f"cpu{cpu}"] = {
+                'avg': round(sum(values) / len(values), 2),
+                'min': round(min(values), 2),
+                'max': round(max(values), 2)
+            }
+        return result
+    else:
+        # Overall statistics
+        values = [s['usage_percent'] for s in samples]
+        return {
+            'avg': round(sum(values) / len(values), 2),
+            'min': round(min(values), 2),
+            'max': round(max(values), 2),
+            'samples': samples
+        }
+@app.route('/perf/offcpu', methods=['POST'])
+def perf_offcpu():
+    """Off-CPU flamegraph - shows blocking time"""
+    data = request.json or {}
+    duration = data.get('duration', 30)
+    pid = data.get('pid')
+
+    timestamp = int(time.time())
+    output = f"/host-tmp/offcpu_{timestamp}"
+
+    if pid:
+        cmd = f"nsenter -t 1 -m -u -n -i /usr/share/bcc/tools/offcputime -df -p {pid} {duration} > {output}.txt"
+    else:
+        cmd = f"nsenter -t 1 -m -u -n -i /usr/share/bcc/tools/offcputime -df {duration} > {output}.txt"
+
+    run_cmd(cmd)
+
+    # Generate flamegraph
+    svg_cmd = f"cat {output}.txt | /opt/FlameGraph/flamegraph.pl --color=io --title='Off-CPU Time' > {output}.svg"
+    run_cmd(svg_cmd)
+
+    return jsonify({
+        'flamegraph': f"{output}.svg",
+        'duration': duration
+    })
+@app.route('/perf/thread_cpu', methods=['POST'])
+def perf_thread_cpu():
+    """Per-thread CPU usage - auto-find PID"""
+    data = request.json or {}
+    pid = data.get('pid')
+    pgrep = data.get('pgrep', 'nr-softmodem')
+    duration = data.get('duration', 10)
+    min_cpu = data.get('min_cpu', 1.0)
+
+    # Auto-discover PID
+    if not pid:
+        pgrep_cmd = f"nsenter -t 1 -m -u -n -i pgrep {pgrep}"
+        pids = run_cmd(pgrep_cmd)
+        if pids:
+            pid = pids.split('\n')[0]
+        else:
+            return jsonify({'error': f'process not found: {pgrep}'}), 404
+
+    # Get per-thread CPU
+    cmd = f"nsenter -t 1 -m -u -n -i pidstat -t -p {pid} 1 {duration}"
+    result = run_cmd(cmd)
+
+    if not result:
+        return jsonify({'error': 'pidstat failed'}), 500
+
+    # Parse threads
+    # Format: TIME AM/PM UID TGID TID %usr %system %guest %wait %CPU CPU Command
+    threads = {}
+    for line in result.split('\n'):
+        if 'TID' in line or not line.strip() or 'Average' in line or 'Linux' in line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 11:
+            continue
+
+        try:
+            # TGID is parts[3], TID is parts[4]
+            tgid = parts[3]
+            tid = parts[4]
+
+            # Skip aggregate lines (TID is "-")
+            if tid == '-':
+                continue
+
+            cpu_pct = float(parts[9])  # %CPU column
+            comm = parts[-1]
+
+            if tid not in threads:
+                threads[tid] = {'name': comm, 'samples': []}
+            threads[tid]['samples'].append(cpu_pct)
+        except:
+            continue
+
+    # Calculate stats and filter
+    thread_stats = []
+    for tid, data in threads.items():
+        samples = data['samples']
+        avg_cpu = sum(samples) / len(samples)
+
+        # Filter low CPU threads
+        if avg_cpu < min_cpu:
+            continue
+
+        thread_stats.append({
+            'tid': tid,
+            'name': data['name'],
+            'avg_cpu': round(avg_cpu, 2),
+            'max_cpu': round(max(samples), 2),
+            'min_cpu': round(min(samples), 2)
+        })
+
+    # Sort by avg CPU descending
+    thread_stats.sort(key=lambda x: x['avg_cpu'], reverse=True)
+
+    return jsonify({
+        'pid': pid,
+        'duration': duration,
+        'total_threads': len(threads),
+        'active_threads': len(thread_stats),
+        'threads': thread_stats
+    })
+
+@app.route('/perf/latency_histogram', methods=['POST'])
+def perf_latency_histogram():
+    """Scheduler latency histogram"""
+    data = request.json or {}
+    duration = data.get('duration', 30)
+
+    # Use perf sched for scheduling latency
+    timestamp = int(time.time())
+    perf_file = f"/host-tmp/sched_{timestamp}.data"
+
+    cmd = f"nsenter -t 1 -m -u -n -i perf sched record -o {perf_file} sleep {duration}"
+    run_cmd(cmd)
+
+    # Get latency stats
+    latency_cmd = f"nsenter -t 1 -m -u -n -i perf sched latency -i {perf_file}"
+    result = run_cmd(latency_cmd)
+
+    return jsonify({
+        'duration': duration,
+        'perf_file': perf_file,
+        'latency_stats': result
+    })
+
+
+@app.route('/perf/cpu_heatmap', methods=['POST'])
+def perf_cpu_heatmap():
+    """CPU usage time-series for heat map visualization"""
+    data = request.json or {}
+    duration = data.get('duration', 60)
+    interval = data.get('interval', 1)
+
+    # mpstat per-CPU over time
+    cmd = f"nsenter -t 1 -m -u -n -i mpstat -P ALL {interval} {duration // interval}"
+    result = run_cmd(cmd)
+
+    # Parse into time-series format
+    timeseries = []
+    current_time = None
+
+    for line in result.split('\n'):
+        if not line.strip() or 'Linux' in line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        try:
+            if 'CPU' in parts:
+                continue
+
+            timestamp = parts[0]
+            cpu_id = parts[2]
+            idle = float(parts[-1])
+            usage = 100.0 - idle
+
+            timeseries.append({
+                'timestamp': timestamp,
+                'cpu': cpu_id,
+                'usage': round(usage, 2)
+            })
+        except:
+            continue
+
+    return jsonify({
+        'duration': duration,
+        'interval': interval,
+        'timeseries': timeseries  # Frontend renders as heat map
+    })
+
 if __name__ == '__main__':
     import time
+
 
     for attempt in range(5):
         if register_with_rapp():
@@ -350,4 +706,4 @@ if __name__ == '__main__':
         print(f"Retry in 10s ({attempt + 1}/5)")
         time.sleep(10)
 
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(host='0.0.0.0', port=svc_port, debug=True, use_reloader=False)

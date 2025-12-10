@@ -17,6 +17,11 @@ spec:
   - name: perf
     image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
     imagePullPolicy: {{ .Values.image.pullPolicy }}
+    env:
+      {{- range $key, $val := .Values.env }}
+      - name: {{ $key }}
+        value: {{ $val | quote }}
+      {{- end }}
     ports:
     - containerPort: {{ .Values.service.port }}
       name: http
