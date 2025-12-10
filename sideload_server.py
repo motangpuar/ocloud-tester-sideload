@@ -1,8 +1,11 @@
 # sideload_server.py - expanded for gNB validation
 from flask import Flask, jsonify, request
 import subprocess
+import socket
+import os
 import time
 import re
+import requests
 
 app = Flask(__name__)
 
@@ -246,5 +249,105 @@ def perf_flamegraph():
 
     return jsonify({'flamegraph': svg_file})
 
+def get_node_ip():
+    """Get node IP address"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return None
+
+def get_rt_report():
+    """Collect RT configuration"""
+    def run(cmd):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except:
+            return None
+
+    return {
+        'isolated_cpus': run("cat /sys/devices/system/cpu/isolated"),
+        'online_cpus': run("cat /sys/devices/system/cpu/online"),
+        'tuned_profile': run("nsenter -t 1 -m -u -n -i tuned-adm active"),
+        'rt_throttling_us': run("cat /proc/sys/kernel/sched_rt_runtime_us"),
+        'rt_period_us': run("cat /proc/sys/kernel/sched_rt_period_us"),
+        'kernel_version': run("nsenter -t 1 -m -u -n -i uname -r"),
+        'cpu_governor': run("nsenter -t 1 -m -u -n -i cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        'hugepages_total': run("nsenter -t 1 -m -u -n -i grep HugePages_Total /proc/meminfo"),
+        'hugepages_free': run("nsenter -t 1 -m -u -n -i grep HugePages_Free /proc/meminfo"),
+        'hugepagesize': run("nsenter -t 1 -m -u -n -i grep Hugepagesize /proc/meminfo")
+    }
+
+def register_with_rapp():
+    """Register with rApp - only provide node identity"""
+    rapp_url = os.getenv('RAPP_URL', 'http://rapp-service:5000')
+    node_name = os.getenv('NODE_NAME', 'unknown')
+
+    ip = get_node_ip()
+    if not ip:
+        print("Failed to get node IP")
+        return False
+
+    rt_report = get_rt_report()
+
+    payload = {
+        'node_name': node_name,
+        'ip_address': ip,
+        'port': 8080,
+        'rt_config': rt_report
+    }
+
+    try:
+        resp = requests.post(f"{rapp_url}/sideload/register", json=payload, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            instance_id = data.get('instance_id')
+            print(f"✓ Registered: {ip}:8080 on {node_name}")
+            print(f"  Assigned ID: {instance_id}")
+
+            # Store the assigned ID for future use (optional)
+            with open('/tmp/instance_id', 'w') as f:
+                f.write(instance_id)
+
+            return True
+        else:
+            print(f"✗ Registration failed: {resp.status_code}")
+            return False
+    except Exception as e:
+        print(f"✗ Failed to register: {e}")
+        return False
+
+@app.route('/report', methods=['GET'])
+def report():
+    """Get fresh RT metrics - no instance_id, just node"""
+    rt_report = get_rt_report()
+
+    # Try to read assigned ID if exists
+    instance_id = 'unknown'
+    try:
+        with open('/tmp/instance_id', 'r') as f:
+            instance_id = f.read().strip()
+    except:
+        pass
+
+    return jsonify({
+        'timestamp': time.time(),
+        'node_name': os.getenv('NODE_NAME', 'unknown'),
+        'instance_id': instance_id,
+        'rt_config': rt_report
+    })
+
 if __name__ == '__main__':
+    import time
+
+    for attempt in range(5):
+        if register_with_rapp():
+            break
+        print(f"Retry in 10s ({attempt + 1}/5)")
+        time.sleep(10)
+
     app.run(host='0.0.0.0', port=8080, debug=True)
