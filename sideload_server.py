@@ -6,6 +6,7 @@ import os
 import time
 import re
 import requests
+import threading
 
 app = Flask(__name__)
 svc_port = os.getenv('SVC_PORT', '8080')
@@ -263,6 +264,27 @@ def get_node_ip():
     except:
         return None
 
+def get_all_node_ips():
+    """Get all IP addresses from host"""
+    cmd = "nsenter -t 1 -m -u -n -i ip -4 addr show | grep inet"
+    result = run_cmd(cmd)
+
+    if not result:
+        return []
+
+    ips = []
+    for line in result.split('\n'):
+        # Parse: inet 192.168.8.82/24 brd...
+        match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
+        if match:
+            ip = match.group(1)
+            print(ip)
+            # Skip localhost
+            if ip != '127.0.0.1':
+                ips.append(ip)
+
+    return ips
+
 def get_rt_report():
     """Collect RT configuration"""
     def run(cmd):
@@ -286,20 +308,23 @@ def get_rt_report():
     }
 
 def register_with_rapp():
-    """Register with rApp - only provide node identity"""
+    """Register with rApp - send all IPs"""
+    rapp_url = os.getenv('RAPP_URL', 'http://rapp-service:5000')
+    node_name = os.getenv('NODE_NAME', 'unknown')
 
-    ip = get_node_ip()
-    if not ip:
-        print("Failed to get node IP")
+    ips = get_all_node_ips()
+    if not ips:
+        print("No IPs found")
         return False
 
     rt_report = get_rt_report()
 
     payload = {
         'node_name': node_name,
-        'ip_address': ip,
+        'ip_addresses': ips,  # Send all IPs
         'port': svc_port,
-        'rt_config': rt_report
+        'rt_config': rt_report,
+        'skip_validation': True
     }
 
     try:
@@ -307,16 +332,18 @@ def register_with_rapp():
         if resp.status_code == 200:
             data = resp.json()
             instance_id = data.get('instance_id')
-            print(f"✓ Registered: {ip}:8080 on {node_name}")
+            validated_ip = data.get('validated_ip')
+            print(f"✓ Registered: {validated_ip}:{svc_port} on {node_name}")
             print(f"  Assigned ID: {instance_id}")
+            print(f"  All IPs: {', '.join(ips)}")
 
-            # Store the assigned ID for future use (optional)
             with open('/tmp/instance_id', 'w') as f:
                 f.write(instance_id)
 
             return True
         else:
             print(f"✗ Registration failed: {resp.status_code}")
+            print(f"Rsponse: {resp.text}")
             return False
     except Exception as e:
         print(f"✗ Failed to register: {e}")
@@ -570,6 +597,7 @@ def perf_thread_cpu():
 
     # Parse threads
     # Format: TIME AM/PM UID TGID TID %usr %system %guest %wait %CPU CPU Command
+    # -----------------
     threads = {}
     for line in result.split('\n'):
         if 'TID' in line or not line.strip() or 'Average' in line or 'Linux' in line:
@@ -580,15 +608,15 @@ def perf_thread_cpu():
             continue
 
         try:
-            # TGID is parts[3], TID is parts[4]
-            tgid = parts[3]
-            tid = parts[4]
+            # TGID is parts[2], TID is parts[3]
+            tgid = parts[2]
+            tid = parts[3]  # CORRECT: index 3
 
             # Skip aggregate lines (TID is "-")
             if tid == '-':
                 continue
 
-            cpu_pct = float(parts[9])  # %CPU column
+            cpu_pct = float(parts[8])  # CORRECT: index 8 for %CPU
             comm = parts[-1]
 
             if tid not in threads:
@@ -623,7 +651,8 @@ def perf_thread_cpu():
         'duration': duration,
         'total_threads': len(threads),
         'active_threads': len(thread_stats),
-        'threads': thread_stats
+        'threads': thread_stats,
+        'raw': result
     })
 
 @app.route('/perf/latency_histogram', methods=['POST'])
@@ -696,14 +725,19 @@ def perf_cpu_heatmap():
         'timeseries': timeseries  # Frontend renders as heat map
     })
 
-if __name__ == '__main__':
-    import time
-
-
+def register_loop():
     for attempt in range(5):
         if register_with_rapp():
             break
         print(f"Retry in 10s ({attempt + 1}/5)")
         time.sleep(10)
 
+if __name__ == '__main__':
+    import time
+
+    registration_thread = threading.Thread(target=register_loop)
+    registration_thread.start()
+
+
     app.run(host='0.0.0.0', port=svc_port, debug=True, use_reloader=False)
+

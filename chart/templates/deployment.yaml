@@ -1,0 +1,49 @@
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.podName }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.podName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.podName }}
+    spec:
+      hostPID: true
+      hostNetwork: true
+      hostIPC: true
+      tolerations:
+{{- toYaml .Values.tolerations | nindent 6 }}
+      nodeSelector:
+{{- toYaml .Values.nodeSelector | nindent 8 }}
+      containers:
+      - name: perf
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+          {{- range $key, $val := .Values.env }}
+          - name: {{ $key }}
+            value: {{ $val | quote }}
+          {{- end }}
+        ports:
+        - containerPort: {{ .Values.service.port }}
+          name: http
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - SYS_PTRACE
+            - PERFMON
+        volumeMounts:
+        - name: host-tmp
+          mountPath: /host-tmp
+      volumes:
+      - name: host-tmp
+        hostPath:
+          path: /tmp
+          type: Directory
